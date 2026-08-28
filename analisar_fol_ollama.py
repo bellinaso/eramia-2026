@@ -1,35 +1,34 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-analisar_fol_ollama.py
-
-Lê um arquivo .jsonl contendo exemplos de raciocínio lógico (premissas,
-versão em FOL das premissas, conclusão, versão em FOL da conclusão e
-label), envia cada exemplo para um modelo local rodando no Ollama e pede
-uma análise sobre a validade lógica da conclusão. Os resultados são
-salvos, de forma incremental, em um novo arquivo .jsonl.
-
-Requisitos:
-    pip install ollama
-
-Uso:
-    python analisar_fol_ollama.py
-    (ajuste as constantes de configuração abaixo conforme necessário)
-"""
-
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import ollama
 
 
-MODEL_NAME = "qwen3.5:9b"
+# --------------------------------------------------------------------------
+# Configuração geral
+# --------------------------------------------------------------------------
+
+# Lista de modelos que serão testados, em sequência, contra o dataset
+# inteiro. Ajuste os nomes conforme os modelos que você tem disponíveis
+# no seu Ollama local (ollama list).
+MODELOS: List[str] = [
+    "qwen3.5:9b",
+    "gemma4:12b"
+]
+
 OLLAMA_HOST = "http://localhost:11434"
 
 INPUT_FILE = "dataset.jsonl"
-OUTPUT_FILE = "resultados_fol.jsonl"
+
+# Intervalo de descanso entre a execução de um modelo e o início do
+# próximo (em segundos). 10 minutos = 600 segundos.
+INTERVALO_ENTRE_MODELOS_SEGUNDOS = 10 * 60
+
+# Arquivo único onde é anexado (append) um resumo por modelo executado.
+RESUMO_SIMULACAO_FILE = "resumo_simulacao.jsonl"
 
 FIELD_MAP = {
     "premises": "premises",
@@ -54,11 +53,13 @@ DEBUG = False
 SYSTEM_PROMPT = (
     "Você é um assistente especialista em lógica formal e lógica de primeira "
     "ordem (FOL). Sua tarefa é analisar se uma conclusão decorre "
-    "logicamente de um conjunto de premissas, usando tanto a versão em "
-    "linguagem natural quanto a versão formal (FOL) quando disponíveis. "
+    "logicamente de um conjunto de premissas em linguagem natural. "
     "Seja rigoroso, objetivo e sempre responda no formato solicitado."
 )
 
+# O prompt agora contém SOMENTE premissas e conclusão em linguagem
+# natural: nada de FOL e nada do label de referência, para que o modelo
+# não seja influenciado por nenhum contexto ou "resposta pronta".
 PROMPT_TEMPLATE = """
 Analise o exemplo de raciocínio lógico abaixo e determine se a CONCLUSÃO é
 válida a partir das PREMISSAS fornecidas.
@@ -66,25 +67,14 @@ válida a partir das PREMISSAS fornecidas.
 PREMISSAS (linguagem natural):
 {premises}
 
-PREMISSAS (FOL):
-{premises_fol}
-
 CONCLUSÃO (linguagem natural):
 {conclusion}
-
-CONCLUSÃO (FOL):
-{conclusion_fol}
-
-LABEL fornecido no dataset (gabarito de referência, pode ser usado como
-ponto de checagem, mas sua análise deve ser feita de forma independente):
-{label}
 
 Responda ESTRITAMENTE no seguinte formato JSON, sem nenhum texto antes ou
 depois:
 
 {{
     "veredito": "<Válido | Inválido | Indeterminado>",
-    "concorda_com_label": <true | false | null>,
     "justificativa": "<explicação lógica objetiva, citando as regras de "
                         "inferência ou contraexemplos relevantes>"
 }}
@@ -92,7 +82,11 @@ depois:
 
 
 def build_prompt(example: Dict[str, Any]) -> str:
-    """Monta o prompt final substituindo os campos do exemplo."""
+    """Monta o prompt final substituindo os campos do exemplo.
+
+    Usa apenas as premissas e a conclusão em linguagem natural — as
+    versões em FOL e o label não entram no prompt.
+    """
     def get(field_key: str) -> str:
         value = example.get(FIELD_MAP[field_key], "")
         if value in (None, "", []):
@@ -105,24 +99,22 @@ def build_prompt(example: Dict[str, Any]) -> str:
 
     return PROMPT_TEMPLATE.format(
         premises=get("premises"),
-        premises_fol=get("premises_fol"),
         conclusion=get("conclusion"),
-        conclusion_fol=get("conclusion_fol"),
-        label=get("label"),
     )
 
 
-def query_ollama(client: ollama.Client, prompt: str) -> str:
+def query_ollama(client: ollama.Client, model_name: str, prompt: str) -> str:
     """
-    Envia o prompt ao modelo via Ollama e retorna o texto bruto da resposta.
-    Faz algumas tentativas em caso de falha de comunicação.
+    Envia o prompt ao modelo `model_name` via Ollama e retorna o texto
+    bruto da resposta. Faz algumas tentativas em caso de falha de
+    comunicação.
     """
     last_error: Optional[Exception] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = client.chat(
-                model=MODEL_NAME,
+                model=model_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -186,7 +178,6 @@ def parse_model_output(raw_text: str) -> Dict[str, Any]:
         parsed = json.loads(text)
         return {
             "veredito": parsed.get("veredito"),
-            "concorda_com_label": parsed.get("concorda_com_label"),
             "justificativa": parsed.get("justificativa"),
             "resposta_bruta": raw_text,
             "parse_ok": True,
@@ -194,11 +185,77 @@ def parse_model_output(raw_text: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         return {
             "veredito": None,
-            "concorda_com_label": None,
             "justificativa": None,
             "resposta_bruta": raw_text,
             "parse_ok": False,
         }
+
+
+def _normalizar_texto(valor: Any) -> str:
+    """Normaliza texto para comparação: minúsculas, sem acentos, sem espaços nas pontas."""
+    if valor is None:
+        return ""
+    texto = str(valor).strip().lower()
+    substituicoes = {
+        "á": "a", "à": "a", "ã": "a", "â": "a",
+        "é": "e", "ê": "e",
+        "í": "i",
+        "ó": "o", "õ": "o", "ô": "o",
+        "ú": "u",
+    }
+    for original, substituto in substituicoes.items():
+        texto = texto.replace(original, substituto)
+    return texto
+
+
+def _mapear_para_categoria(valor: Any) -> Optional[bool]:
+    """
+    Mapeia diferentes representações de veredito/label para um valor
+    booleano canônico:
+        True  -> conclusão válida
+        False -> conclusão inválida
+        None  -> indeterminado / não foi possível mapear
+
+    IMPORTANTE: ajuste os conjuntos abaixo caso o seu dataset use outras
+    convenções de rótulo (por exemplo "entailment" / "contradiction" /
+    "neutral", ou algum outro esquema específico do seu dataset).
+    """
+    texto = _normalizar_texto(valor)
+
+    validos = {"valido", "true", "verdadeiro", "1", "entailment", "yes", "sim"}
+    invalidos = {"invalido", "false", "falso", "0", "contradiction", "no", "nao"}
+
+    if texto in validos:
+        return True
+    if texto in invalidos:
+        return False
+    return None
+
+
+def calcular_acertou(veredito: Any, label: Any) -> Optional[bool]:
+    """
+    Compara o veredito dado pelo modelo com o label de referência do
+    dataset (que NÃO foi mostrado ao modelo no prompt) e retorna:
+        True  -> o modelo acertou
+        False -> o modelo errou
+        None  -> não foi possível determinar (veredito e/ou label
+                 indeterminado ou em formato não reconhecido)
+    """
+    veredito_bool = _mapear_para_categoria(veredito)
+    label_bool = _mapear_para_categoria(label)
+
+    if veredito_bool is None or label_bool is None:
+        return None
+
+    return veredito_bool == label_bool
+
+
+def sanitizar_nome_arquivo(nome_modelo: str) -> str:
+    """Transforma o nome do modelo (ex.: 'qwen3.5:9b') em um nome de arquivo seguro."""
+    nome = nome_modelo.strip().lower()
+    for caractere in [":", "/", "\\", " "]:
+        nome = nome.replace(caractere, "_")
+    return nome
 
 
 def iter_json_records(file_obj):
@@ -241,7 +298,12 @@ def iter_json_records(file_obj):
         idx = end_idx
 
 
-def process_file(input_path: str, output_path: str) -> None:
+def process_file(client: ollama.Client, input_path: str, output_path: str, model_name: str) -> Dict[str, Any]:
+    """
+    Processa o dataset inteiro para um único modelo, salvando o arquivo
+    de resultados individual e retornando um dicionário de resumo com
+    as estatísticas da execução.
+    """
     in_file = Path(input_path)
     out_file = Path(output_path)
 
@@ -249,11 +311,14 @@ def process_file(input_path: str, output_path: str) -> None:
         print(f"[erro] arquivo de entrada não encontrado: {in_file}", file=sys.stderr)
         sys.exit(1)
 
-    client = ollama.Client(host=OLLAMA_HOST)
-
     total = 0
-    ok = 0
-    failed = 0
+    falhas_processamento = 0
+    acertos = 0
+    erros = 0
+    indeterminados = 0
+    tempos_por_exemplo: List[float] = []
+
+    horario_inicio = datetime.now()
 
     with in_file.open("r", encoding="utf-8") as fin, \
         out_file.open("w", encoding="utf-8") as fout:
@@ -266,14 +331,16 @@ def process_file(input_path: str, output_path: str) -> None:
 
         for record_number, example, _raw_text in records:
             total += 1
-            print(f"[{record_number}] processando exemplo...")
+            print(f"[{model_name}] [{record_number}] processando exemplo...")
 
             prompt = build_prompt(example)
             result_record: Dict[str, Any] = dict(example) # preserva os campos originais
 
+            inicio_exemplo = time.time()
             try:
-                raw_output = query_ollama(client, prompt)
+                raw_output = query_ollama(client, model_name, prompt)
                 analysis = parse_model_output(raw_output)
+
                 if not analysis["parse_ok"]:
                     print(
                         f"  [aviso] registro {record_number}: não foi possível "
@@ -281,24 +348,97 @@ def process_file(input_path: str, output_path: str) -> None:
                         f"Veja 'resposta_bruta' no resultado.",
                         file=sys.stderr,
                     )
+
+                label_original = example.get(FIELD_MAP["label"])
+                acertou = calcular_acertou(analysis.get("veredito"), label_original)
+                analysis["acertou"] = acertou
+
+                if acertou is True:
+                    acertos += 1
+                elif acertou is False:
+                    erros += 1
+                else:
+                    indeterminados += 1
+
                 result_record["analise_modelo"] = analysis
                 result_record["erro"] = None
-                ok += 1
             except Exception as exc:
                 print(f"  [erro] falha ao processar registro {record_number}: {exc}", file=sys.stderr)
                 result_record["analise_modelo"] = None
                 result_record["erro"] = str(exc)
-                failed += 1
+                falhas_processamento += 1
+            finally:
+                tempos_por_exemplo.append(time.time() - inicio_exemplo)
 
             fout.write(json.dumps(result_record, ensure_ascii=False) + "\n")
             fout.flush()
 
-    print("\n=== Resumo ===")
+    horario_fim = datetime.now()
+    tempo_total_segundos = sum(tempos_por_exemplo)
+    tempo_medio_por_exemplo = (
+        tempo_total_segundos / len(tempos_por_exemplo) if tempos_por_exemplo else 0.0
+    )
+
+    resumo = {
+        "modelo": model_name,
+        "horario_inicio": horario_inicio.isoformat(timespec="seconds"),
+        "horario_fim": horario_fim.isoformat(timespec="seconds"),
+        "duracao_total_segundos": round((horario_fim - horario_inicio).total_seconds(), 2),
+        "total_exemplos": total,
+        "acertos": acertos,
+        "erros": erros,
+        "indeterminados": indeterminados,
+        "falhas_processamento": falhas_processamento,
+        "tempo_medio_por_exemplo_segundos": round(tempo_medio_por_exemplo, 2),
+        "arquivo_resultados": str(out_file.resolve()),
+    }
+
+    print("\n=== Resumo do modelo:", model_name, "===")
     print(f"Total de exemplos lidos:   {total}")
-    print(f"Processados com sucesso:   {ok}")
-    print(f"Falharam:                  {failed}")
+    print(f"Acertos:                   {acertos}")
+    print(f"Erros:                     {erros}")
+    print(f"Indeterminados:            {indeterminados}")
+    print(f"Falhas de processamento:   {falhas_processamento}")
+    print(f"Tempo médio por exemplo:   {tempo_medio_por_exemplo:.2f}s")
     print(f"Resultados salvos em:      {out_file.resolve()}")
+
+    return resumo
+
+
+def salvar_resumo_simulacao(resumo: Dict[str, Any], resumo_path: str) -> None:
+    """Anexa (append) uma linha de resumo ao arquivo de resumo da simulação."""
+    with Path(resumo_path).open("a", encoding="utf-8") as f:
+        f.write(json.dumps(resumo, ensure_ascii=False) + "\n")
+
+
+def executar_para_todos_modelos() -> None:
+    """
+    Executa o dataset inteiro para cada modelo em MODELOS, salvando um
+    arquivo de resultados por modelo e aguardando
+    INTERVALO_ENTRE_MODELOS_SEGUNDOS entre uma execução e outra.
+    """
+    if not MODELOS:
+        print("[erro] a lista MODELOS está vazia. Adicione ao menos um modelo.", file=sys.stderr)
+        sys.exit(1)
+
+    client = ollama.Client(host=OLLAMA_HOST)
+
+    for indice, modelo in enumerate(MODELOS):
+        print(f"\n=== Iniciando execução para o modelo: {modelo} ({indice + 1}/{len(MODELOS)}) ===")
+
+        nome_arquivo_saida = f"{sanitizar_nome_arquivo(modelo)}_without_solver.jsonl"
+        resumo = process_file(client, INPUT_FILE, nome_arquivo_saida, modelo)
+        salvar_resumo_simulacao(resumo, RESUMO_SIMULACAO_FILE)
+
+        ultimo_modelo = indice == len(MODELOS) - 1
+        if not ultimo_modelo:
+            minutos = INTERVALO_ENTRE_MODELOS_SEGUNDOS // 60
+            print(f"\nAguardando {minutos} minutos antes de iniciar o próximo modelo...")
+            time.sleep(INTERVALO_ENTRE_MODELOS_SEGUNDOS)
+
+    print("\n=== Execução concluída para todos os modelos ===")
+    print(f"Resumo geral salvo em: {Path(RESUMO_SIMULACAO_FILE).resolve()}")
 
 
 if __name__ == "__main__":
-    process_file(INPUT_FILE, OUTPUT_FILE)
+    executar_para_todos_modelos()
