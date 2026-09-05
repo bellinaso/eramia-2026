@@ -7,16 +7,11 @@ from typing import Any, Dict, List, Optional
 import ollama
 
 
-# --------------------------------------------------------------------------
-# Configuração geral
-# --------------------------------------------------------------------------
-
 # Lista de modelos que serão testados, em sequência, contra o dataset
 # inteiro. Ajuste os nomes conforme os modelos que você tem disponíveis
 # no seu Ollama local (ollama list).
 MODELOS: List[str] = [
-    "qwen3.5:9b",
-    "gemma4:12b"
+    "llama3.2:3b"
 ]
 
 OLLAMA_HOST = "http://localhost:11434"
@@ -239,7 +234,7 @@ def calcular_acertou(veredito: Any, label: Any) -> Optional[bool]:
         True  -> o modelo acertou
         False -> o modelo errou
         None  -> não foi possível determinar (veredito e/ou label
-                 indeterminado ou em formato não reconhecido)
+                indeterminado ou em formato não reconhecido)
     """
     veredito_bool = _mapear_para_categoria(veredito)
     label_bool = _mapear_para_categoria(label)
@@ -414,8 +409,16 @@ def salvar_resumo_simulacao(resumo: Dict[str, Any], resumo_path: str) -> None:
 def executar_para_todos_modelos() -> None:
     """
     Executa o dataset inteiro para cada modelo em MODELOS, salvando um
-    arquivo de resultados por modelo e aguardando
+    arquivo de resultados por modelo (com timestamp único desta execução,
+    para nunca sobrescrever resultados de simulações anteriores mesmo que
+    o mesmo modelo seja testado de novo no futuro) e aguardando
     INTERVALO_ENTRE_MODELOS_SEGUNDOS entre uma execução e outra.
+
+    A lista MODELOS pode ser livremente editada (remover modelos, trocar
+    por outros) entre uma chamada e outra do script: o arquivo de resumo
+    (RESUMO_SIMULACAO_FILE) é sempre aberto em modo append, então cada
+    simulação apenas adiciona novas linhas, nunca apaga o histórico
+    anterior.
     """
     if not MODELOS:
         print("[erro] a lista MODELOS está vazia. Adicione ao menos um modelo.", file=sys.stderr)
@@ -423,11 +426,18 @@ def executar_para_todos_modelos() -> None:
 
     client = ollama.Client(host=OLLAMA_HOST)
 
+    # Identificador único desta chamada do script (mesmo para todos os
+    # modelos executados nela), usado para nunca sobrescrever arquivos de
+    # execuções passadas ou futuras, mesmo que o mesmo modelo seja
+    # testado novamente em outra simulação.
+    execucao_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     for indice, modelo in enumerate(MODELOS):
         print(f"\n=== Iniciando execução para o modelo: {modelo} ({indice + 1}/{len(MODELOS)}) ===")
 
-        nome_arquivo_saida = f"{sanitizar_nome_arquivo(modelo)}_without_solver.jsonl"
+        nome_arquivo_saida = f"{sanitizar_nome_arquivo(modelo)}_{execucao_id}_without_solver.jsonl"
         resumo = process_file(client, INPUT_FILE, nome_arquivo_saida, modelo)
+        resumo["execucao_id"] = execucao_id
         salvar_resumo_simulacao(resumo, RESUMO_SIMULACAO_FILE)
 
         ultimo_modelo = indice == len(MODELOS) - 1
