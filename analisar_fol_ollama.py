@@ -11,7 +11,9 @@ import ollama
 # inteiro. Ajuste os nomes conforme os modelos que você tem disponíveis
 # no seu Ollama local (ollama list).
 MODELOS: List[str] = [
-    "llama3.2:3b"
+    "gemma4:12b",
+    "qwen3.5:9b",
+    "lamma3.2:3b"
 ]
 
 OLLAMA_HOST = "http://localhost:11434"
@@ -203,13 +205,16 @@ def _normalizar_texto(valor: Any) -> str:
     return texto
 
 
-def _mapear_para_categoria(valor: Any) -> Optional[bool]:
+def _mapear_para_categoria(valor: Any) -> Optional[str]:
     """
-    Mapeia diferentes representações de veredito/label para um valor
-    booleano canônico:
-        True  -> conclusão válida
-        False -> conclusão inválida
-        None  -> indeterminado / não foi possível mapear
+    Mapeia diferentes representações de veredito/label para uma categoria
+    canônica de 3 vias:
+        "valido"        -> conclusão válida / label positivo
+        "invalido"      -> conclusão inválida / label negativo
+        "indeterminado" -> conclusão indeterminada / label "incerto"
+        None            -> formato não reconhecido (nem sequer uma das
+                            3 categorias acima) — só isso conta como
+                            "não foi possível comparar".
 
     IMPORTANTE: ajuste os conjuntos abaixo caso o seu dataset use outras
     convenções de rótulo (por exemplo "entailment" / "contradiction" /
@@ -219,11 +224,17 @@ def _mapear_para_categoria(valor: Any) -> Optional[bool]:
 
     validos = {"valido", "true", "verdadeiro", "1", "entailment", "yes", "sim"}
     invalidos = {"invalido", "false", "falso", "0", "contradiction", "no", "nao"}
+    indeterminados = {
+        "indeterminado", "incerto", "uncertain", "unknown",
+        "neutral", "desconhecido",
+    }
 
     if texto in validos:
-        return True
+        return "valido"
     if texto in invalidos:
-        return False
+        return "invalido"
+    if texto in indeterminados:
+        return "indeterminado"
     return None
 
 
@@ -231,18 +242,21 @@ def calcular_acertou(veredito: Any, label: Any) -> Optional[bool]:
     """
     Compara o veredito dado pelo modelo com o label de referência do
     dataset (que NÃO foi mostrado ao modelo no prompt) e retorna:
-        True  -> o modelo acertou
+        True  -> o modelo acertou (inclui o caso em que ambos caem na
+                categoria "indeterminado"/"uncertain" — isso é um
+                acerto, não uma comparação impossível)
         False -> o modelo errou
-        None  -> não foi possível determinar (veredito e/ou label
-                indeterminado ou em formato não reconhecido)
+        None  -> não foi possível determinar, porque o veredito e/ou o
+                label vieram em um formato não reconhecido por
+                _mapear_para_categoria (nenhuma das 3 categorias)
     """
-    veredito_bool = _mapear_para_categoria(veredito)
-    label_bool = _mapear_para_categoria(label)
+    categoria_veredito = _mapear_para_categoria(veredito)
+    categoria_label = _mapear_para_categoria(label)
 
-    if veredito_bool is None or label_bool is None:
+    if categoria_veredito is None or categoria_label is None:
         return None
 
-    return veredito_bool == label_bool
+    return categoria_veredito == categoria_label
 
 
 def sanitizar_nome_arquivo(nome_modelo: str) -> str:
@@ -310,7 +324,7 @@ def process_file(client: ollama.Client, input_path: str, output_path: str, model
     falhas_processamento = 0
     acertos = 0
     erros = 0
-    indeterminados = 0
+    nao_comparaveis = 0
     tempos_por_exemplo: List[float] = []
 
     horario_inicio = datetime.now()
@@ -353,7 +367,12 @@ def process_file(client: ollama.Client, input_path: str, output_path: str, model
                 elif acertou is False:
                     erros += 1
                 else:
-                    indeterminados += 1
+                    # acertou is None: veredito e/ou label vieram em um
+                    # formato que _mapear_para_categoria não reconhece
+                    # (não é "indeterminado/uncertain" — isso já conta
+                    # como acerto ou erro acima; aqui é caso raro de
+                    # texto fora do esperado).
+                    nao_comparaveis += 1
 
                 result_record["analise_modelo"] = analysis
                 result_record["erro"] = None
@@ -374,25 +393,31 @@ def process_file(client: ollama.Client, input_path: str, output_path: str, model
         tempo_total_segundos / len(tempos_por_exemplo) if tempos_por_exemplo else 0.0
     )
 
+    comparaveis = acertos + erros
+    acuracia = (acertos / comparaveis) if comparaveis > 0 else None
+
+    # Esquema fixo e enxuto salvo no arquivo de resumo — sempre estas
+    # chaves, nesta ordem, com horário/duração da execução mas sem
+    # caminhos de arquivo.
     resumo = {
-        "modelo": model_name,
+        "modelo": f"{sanitizar_nome_arquivo(model_name)}_without_solver",
         "horario_inicio": horario_inicio.isoformat(timespec="seconds"),
         "horario_fim": horario_fim.isoformat(timespec="seconds"),
         "duracao_total_segundos": round((horario_fim - horario_inicio).total_seconds(), 2),
         "total_exemplos": total,
         "acertos": acertos,
         "erros": erros,
-        "indeterminados": indeterminados,
+        "nao_comparaveis": nao_comparaveis,
         "falhas_processamento": falhas_processamento,
-        "tempo_medio_por_exemplo_segundos": round(tempo_medio_por_exemplo, 2),
-        "arquivo_resultados": str(out_file.resolve()),
+        "acuracia": round(acuracia, 4) if acuracia is not None else None,
     }
 
     print("\n=== Resumo do modelo:", model_name, "===")
     print(f"Total de exemplos lidos:   {total}")
     print(f"Acertos:                   {acertos}")
     print(f"Erros:                     {erros}")
-    print(f"Indeterminados:            {indeterminados}")
+    print(f"Não comparáveis (formato): {nao_comparaveis}")
+    print(f"Acurácia (sobre comparáveis): {acuracia:.2%}" if acuracia is not None else "Acurácia: N/A")
     print(f"Falhas de processamento:   {falhas_processamento}")
     print(f"Tempo médio por exemplo:   {tempo_medio_por_exemplo:.2f}s")
     print(f"Resultados salvos em:      {out_file.resolve()}")
@@ -437,7 +462,6 @@ def executar_para_todos_modelos() -> None:
 
         nome_arquivo_saida = f"{sanitizar_nome_arquivo(modelo)}_{execucao_id}_without_solver.jsonl"
         resumo = process_file(client, INPUT_FILE, nome_arquivo_saida, modelo)
-        resumo["execucao_id"] = execucao_id
         salvar_resumo_simulacao(resumo, RESUMO_SIMULACAO_FILE)
 
         ultimo_modelo = indice == len(MODELOS) - 1

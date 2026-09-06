@@ -1,1 +1,4 @@
 .venv
+__pycache__/
+traducao_prover9/
+*_teste*.jsonl
